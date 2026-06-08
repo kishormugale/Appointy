@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Appointy - Database Stack: DocumentDB Cluster, Secrets Manager'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.medium
+      - db.r5.large
+      - db.r5.xlarge
+
+  DBMasterUsername:
+    Type: String
+    Default: appointyadmin
+    NoEcho: true
+
+Resources:
+  # ==================== SECRETS MANAGER ====================
+
+  # DocumentDB credentials
+  DocumentDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/appointy/documentdb'
+      Description: DocumentDB master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # Application secrets (JWT, Cloudinary, Razorpay, Admin creds)
+  AppSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/appointy/app'
+      Description: Application secrets (JWT, Cloudinary, Razorpay, Admin credentials)
+      SecretString: '{"JWT_SECRET":"CHANGE_ME","ADMIN_EMAIL":"admin@appointy.com","ADMIN_PASSWORD":"CHANGE_ME","CLOUDINARY_NAME":"CHANGE_ME","CLOUDINARY_API_KEY":"CHANGE_ME","CLOUDINARY_SECRET_KEY":"CHANGE_ME","RAZORPAY_API_KEY":"CHANGE_ME","RAZORPAY_KEY_SECRET":"CHANGE_ME"}'
+
+  # ==================== DOCUMENTDB ====================
+
+  DocumentDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for DocumentDB
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateDbSubnet1Id'
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateDbSubnet2Id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-docdb-subnet-group'
+
+  DocumentDBClusterParameterGroup:
+    Type: AWS::DocDB::DBClusterParameterGroup
+    Properties:
+      Description: DocumentDB cluster parameter group for Appointy
+      Family: docdb5.0
+      Parameters:
+        tls: enabled
+        audit_logs: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-docdb-params'
+
+  DocumentDBCluster:
+    Type: AWS::DocDB::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${EnvironmentName}-appointy-docdb'
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DocumentDBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DocumentDBSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DocumentDBSubnetGroup
+      DBClusterParameterGroupName: !Ref DocumentDBClusterParameterGroup
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-DocumentDBSecurityGroupId'
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 02:00-04:00
+      PreferredMaintenanceWindow: sun:04:00-sun:06:00
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-appointy-docdb'
+
+  DocumentDBInstance1:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DocumentDBCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-appointy-docdb-1'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-docdb-instance-1'
+
+  DocumentDBInstance2:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DocumentDBCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-appointy-docdb-2'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-docdb-instance-2'
+
+  # Attach secret to DocumentDB for rotation support
+  SecretDocDBAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DocumentDBSecret
+      TargetId: !Ref DocumentDBCluster
+      TargetType: AWS::DocDB::DBCluster
+
+Outputs:
+  DocumentDBClusterEndpoint:
+    Value: !GetAtt DocumentDBCluster.Endpoint
+    Export:
+      Name: !Sub '${EnvironmentName}-DocumentDBEndpoint'
+
+  DocumentDBClusterPort:
+    Value: !GetAtt DocumentDBCluster.Port
+    Export:
+      Name: !Sub '${EnvironmentName}-DocumentDBPort'
+
+  DocumentDBSecretArn:
+    Value: !Ref DocumentDBSecret
+    Export:
+      Name: !Sub '${EnvironmentName}-DocumentDBSecretArn'
+
+  AppSecretsArn:
+    Value: !Ref AppSecrets
+    Export:
+      Name: !Sub '${EnvironmentName}-AppSecretsArn'

@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Appointy - CI/CD Stack: CodePipeline, CodeBuild, CodeDeploy'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of CodeStar Connection to GitHub (must be created manually in console)
+
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: Appointy
+
+  GitHubBranch:
+    Type: String
+    Default: master
+
+  DomainName:
+    Type: String
+    Description: Root domain name (e.g., appointy.com)
+
+  ApiSubdomain:
+    Type: String
+    Default: api
+
+Resources:
+  # ==================== CODEBUILD PROJECTS ====================
+
+  # Build backend
+  BackendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${EnvironmentName}-appointy-backend-build'
+      ServiceRole:
+        Fn::ImportValue: !Sub '${EnvironmentName}-CodeBuildRoleArn'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref EnvironmentName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-backend.yml
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-build'
+
+  # Build frontend
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${EnvironmentName}-appointy-frontend-build'
+      ServiceRole:
+        Fn::ImportValue: !Sub '${EnvironmentName}-CodeBuildRoleArn'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref EnvironmentName
+          - Name: VITE_BACKEND_URL
+            Value: !Sub 'https://${ApiSubdomain}.${DomainName}'
+          - Name: FRONTEND_BUCKET
+            Value:
+              Fn::ImportValue: !Sub '${EnvironmentName}-FrontendBucketName'
+          - Name: FRONTEND_DISTRIBUTION_ID
+            Value:
+              Fn::ImportValue: !Sub '${EnvironmentName}-FrontendDistributionId'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-frontend.yml
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-build'
+
+  # Build admin
+  AdminBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${EnvironmentName}-appointy-admin-build'
+      ServiceRole:
+        Fn::ImportValue: !Sub '${EnvironmentName}-CodeBuildRoleArn'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref EnvironmentName
+          - Name: VITE_BACKEND_URL
+            Value: !Sub 'https://${ApiSubdomain}.${DomainName}'
+          - Name: ADMIN_BUCKET
+            Value:
+              Fn::ImportValue: !Sub '${EnvironmentName}-AdminBucketName'
+          - Name: ADMIN_DISTRIBUTION_ID
+            Value:
+              Fn::ImportValue: !Sub '${EnvironmentName}-AdminDistributionId'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-admin.yml
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-admin-build'
+
+  # ==================== CODEDEPLOY ====================
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-appointy-backend'
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${EnvironmentName}-appointy-backend-dg'
+      ServiceRoleArn:
+        Fn::ImportValue: !Sub '${EnvironmentName}-CodeDeployRoleArn'
+      AutoScalingGroups:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-ASGName'
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle:
+        DeploymentType: IN_PLACE
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Sub '${EnvironmentName}-appointy-tg'
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+
+  # ==================== CODEPIPELINE ====================
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${EnvironmentName}-appointy-pipeline'
+      RoleArn:
+        Fn::ImportValue: !Sub '${EnvironmentName}-CodePipelineRoleArn'
+      ArtifactStore:
+        Type: S3
+        Location:
+          Fn::ImportValue: !Sub '${EnvironmentName}-ArtifactsBucketName'
+      Stages:
+        # Stage 1: Source from GitHub
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        # Stage 2: Build all three apps in parallel
+        - Name: Build
+          Actions:
+            - Name: BuildBackend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BackendBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BackendBuildOutput
+              RunOrder: 1
+
+            - Name: BuildFrontend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref FrontendBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: FrontendBuildOutput
+              RunOrder: 1
+
+            - Name: BuildAdmin
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AdminBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: AdminBuildOutput
+              RunOrder: 1
+
+        # Stage 3: Deploy backend to EC2 via CodeDeploy
+        - Name: Deploy
+          Actions:
+            - Name: DeployBackend
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              InputArtifacts:
+                - Name: BackendBuildOutput
+              RunOrder: 1
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub '${EnvironmentName}-PipelineName'
+
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub '${EnvironmentName}-CodeDeployAppName'

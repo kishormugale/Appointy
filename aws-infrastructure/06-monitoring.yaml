@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Appointy - Monitoring Stack: CloudWatch Dashboards, Alarms, SNS'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  AlertEmail:
+    Type: String
+    Description: Email address for alarm notifications
+
+Resources:
+  # ==================== SNS TOPIC ====================
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-appointy-alarms'
+      DisplayName: Appointy Alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ==================== CLOUDWATCH ALARMS ====================
+
+  # ALB 5xx errors
+  ALB5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-alb-5xx'
+      AlarmDescription: ALB is returning 5xx errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value:
+            Fn::ImportValue: !Sub '${EnvironmentName}-ALBFullName'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ALB response time
+  ALBLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-alb-latency'
+      AlarmDescription: ALB target response time is high
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value:
+            Fn::ImportValue: !Sub '${EnvironmentName}-ALBFullName'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2.0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # Unhealthy host count (requires both LoadBalancer and TargetGroup dimensions)
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-unhealthy-hosts'
+      AlarmDescription: One or more targets are unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value:
+            Fn::ImportValue: !Sub '${EnvironmentName}-TargetGroupFullName'
+        - Name: LoadBalancer
+          Value:
+            Fn::ImportValue: !Sub '${EnvironmentName}-ALBFullName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ASG CPU high
+  ASGCpuHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-asg-cpu-high'
+      AlarmDescription: ASG average CPU is above 85%
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Fn::ImportValue: !Sub '${EnvironmentName}-ASGName'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # DocumentDB CPU
+  DocumentDBCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-docdb-cpu'
+      AlarmDescription: DocumentDB CPU utilization is above 80%
+      Namespace: AWS/DocDB
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Sub '${EnvironmentName}-appointy-docdb'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # DocumentDB free storage
+  DocumentDBStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-appointy-docdb-storage'
+      AlarmDescription: DocumentDB free local storage is below 5GB
+      Namespace: AWS/DocDB
+      MetricName: FreeLocalStorage
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Sub '${EnvironmentName}-appointy-docdb'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5368709120
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ==================== CLOUDWATCH DASHBOARD ====================
+
+  AppDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-appointy-dashboard'
+      DashboardBody:
+        Fn::Sub:
+          - |
+            {
+              "widgets": [
+                {
+                  "type": "metric",
+                  "x": 0, "y": 0, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "ALB Request Count",
+                    "metrics": [
+                      ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ALBFullName}", { "stat": "Sum", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12, "y": 0, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "ALB Response Time",
+                    "metrics": [
+                      ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ALBFullName}", { "stat": "Average", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0, "y": 6, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "ALB HTTP Status Codes",
+                    "metrics": [
+                      ["AWS/ApplicationELB", "HTTPCode_Target_2XX_Count", "LoadBalancer", "${ALBFullName}", { "stat": "Sum", "period": 300 }],
+                      ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "${ALBFullName}", { "stat": "Sum", "period": 300 }],
+                      ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${ALBFullName}", { "stat": "Sum", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12, "y": 6, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "EC2 CPU Utilization (ASG)",
+                    "metrics": [
+                      ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${ASGName}", { "stat": "Average", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0, "y": 12, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "DocumentDB CPU Utilization",
+                    "metrics": [
+                      ["AWS/DocDB", "CPUUtilization", "DBClusterIdentifier", "${EnvironmentName}-appointy-docdb", { "stat": "Average", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12, "y": 12, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "DocumentDB Connections",
+                    "metrics": [
+                      ["AWS/DocDB", "DatabaseConnections", "DBClusterIdentifier", "${EnvironmentName}-appointy-docdb", { "stat": "Sum", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0, "y": 18, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "ASG Instance Count",
+                    "metrics": [
+                      ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${ASGName}", { "stat": "Average", "period": 300 }],
+                      ["AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${ASGName}", { "stat": "Average", "period": 300 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12, "y": 18, "width": 12, "height": 6,
+                  "properties": {
+                    "title": "Healthy vs Unhealthy Hosts",
+                    "metrics": [
+                      ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TGFullName}", "LoadBalancer", "${ALBFullName}", { "stat": "Average", "period": 60 }],
+                      ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TGFullName}", "LoadBalancer", "${ALBFullName}", { "stat": "Average", "period": 60 }]
+                    ],
+                    "region": "${AWS::Region}",
+                    "view": "timeSeries"
+                  }
+                }
+              ]
+            }
+          - ALBFullName:
+              Fn::ImportValue: !Sub '${EnvironmentName}-ALBFullName'
+            TGFullName:
+              Fn::ImportValue: !Sub '${EnvironmentName}-TargetGroupFullName'
+            ASGName:
+              Fn::ImportValue: !Sub '${EnvironmentName}-ASGName'
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${EnvironmentName}-AlarmTopicArn'
+
+  DashboardName:
+    Value: !Ref AppDashboard
+    Export:
+      Name: !Sub '${EnvironmentName}-DashboardName'
